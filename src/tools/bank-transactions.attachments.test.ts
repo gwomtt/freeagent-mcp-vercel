@@ -182,4 +182,24 @@ describe("bank transaction explanation attachments (2026-09-01)", () => {
     expect(parsed.attachments[0]?.file_name).toBe("a.png");
     expect(parsed.attachments[0]?.content_src).toBeUndefined();
   });
+
+  it("preserves opt-in bulk download URLs under the multi-attachment API", async () => {
+    get.mockResolvedValueOnce({
+      data: { bank_transaction_explanations: [{
+        url: "https://api.freeagent.com/v2/bank_transaction_explanations/3",
+        dated_on: "2026-11-25", gross_value: "-5.00",
+        attachments: [{ url: "https://api.freeagent.com/v2/attachments/1" }],
+      }] }, headers: {},
+    }).mockResolvedValueOnce({ data: { attachments: [{
+      url: "https://api.freeagent.com/v2/attachments/1",
+      file_name: "receipt.pdf", content_src: "https://files.example/signed-receipt",
+      expires_at: "2026-11-25T15:00:00Z",
+    }] } });
+    const result = JSON.parse(await listBankTransactionExplanations(client, {
+      page: 1, per_page: 5, response_format: ResponseFormat.JSON, include_download_urls: true,
+    }));
+    expect(result.explanations[0].attachments[0].content_src).toBe("https://files.example/signed-receipt");
+    expect(result.explanations[0].attachment.file_name).toBe("receipt.pdf");
+    expect(get).toHaveBeenCalledTimes(2);
+  });
 });

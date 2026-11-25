@@ -10,9 +10,11 @@
 import { gunzipSync } from "zlib";
 import { fetchStagedAttachmentBytes } from "./attachment-staging.js";
 import { readLocalAttachment } from "./attachment-local-path.js";
+import { readAttachmentUrl } from "./attachment-url.js";
 
 export interface AttachmentInput {
   path?: string;
+  url?: string;
   data?: string;
   upload_id?: string;
   is_gzipped?: boolean;
@@ -24,6 +26,7 @@ export interface AttachmentInput {
 function countSources(attachment: AttachmentInput): string[] {
   const sources: string[] = [];
   if (typeof attachment.path === "string" && attachment.path.length > 0) sources.push("path");
+  if (typeof attachment.url === "string" && attachment.url.length > 0) sources.push("url");
   if (typeof attachment.data === "string" && attachment.data.length > 0) sources.push("data");
   if (typeof attachment.upload_id === "string" && attachment.upload_id.length > 0) {
     sources.push("upload_id");
@@ -37,12 +40,12 @@ export async function buildAttachmentPayload(
   const sources = countSources(attachment);
   if (sources.length > 1) {
     throw new Error(
-      `Provide exactly one of attachment.path, attachment.upload_id, or attachment.data (got ${sources.join(", ")})`
+      `Provide exactly one of attachment.path, attachment.url, attachment.upload_id, or attachment.data (got ${sources.join(", ")})`
     );
   }
   if (sources.length === 0) {
     throw new Error(
-      "Attachment requires one of: path (local FREEAGENT_ATTACHMENTS_DIR), " +
+      "Attachment requires one of: path (local FREEAGENT_ATTACHMENTS_DIR), url (HTTPS download), " +
         "upload_id (from freeagent_prepare_attachment_upload), or data (base64)"
     );
   }
@@ -60,6 +63,11 @@ export async function buildAttachmentPayload(
     attachmentData = local.buffer.toString("base64");
     fileName = fileName || local.file_name;
     contentType = contentType || local.content_type;
+  } else if (sources[0] === "url") {
+    const downloaded = await readAttachmentUrl(attachment.url!);
+    attachmentData = downloaded.data;
+    fileName = fileName || downloaded.file_name;
+    contentType = contentType || downloaded.content_type;
   } else if (sources[0] === "upload_id") {
     const staged = await fetchStagedAttachmentBytes(attachment.upload_id!);
     attachmentData = staged.buffer.toString("base64");

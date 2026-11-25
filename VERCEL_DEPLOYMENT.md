@@ -71,6 +71,18 @@ into an error.
 
 `FREEAGENT_ATTACHMENTS_DIR` / `attachment.path` is for **local stdio** only — a Vercel function cannot read files on the user’s laptop.
 
+### Team Table deployment compatibility
+
+This deployment also retains `attachment.url` for existing public HTTPS receipt
+download links. It does not make private files public or change Drive permissions.
+Use one source per attachment: `url`, `path`, `upload_id`, or `data`.
+
+The explanation-list option `include_download_urls: true` retains bulk export.
+With the multi-attachment API it requires an extra request per explanation with
+receipts, so use small pages and download promptly before the signed links expire.
+The `attachments` array contains all receipt links; the legacy `attachment` field
+contains the first receipt for existing exporters. Ordinary lists omit downloads.
+
 #### Via Vercel CLI
 
 ```bash

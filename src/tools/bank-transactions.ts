@@ -33,7 +33,7 @@ export async function listBankTransactionExplanations(
   client: FreeAgentApiClient,
   params: ListBankTransactionExplanationsInput
 ): Promise<string> {
-  const { page, per_page, bank_account, from_date, to_date, response_format } = params;
+  const { page, per_page, bank_account, from_date, to_date, response_format, include_download_urls } = params;
 
   // Build query parameters
   const queryParams: Record<string, string> = {
@@ -51,6 +51,20 @@ export async function listBankTransactionExplanations(
   );
   const explanations = response.data.bank_transaction_explanations || [];
   const pagination = client.parsePaginationHeaders(response.headers);
+
+  // Preserve the deployment's opt-in bulk export without adding normal-list reads.
+  const downloads = new Map<string, Array<Record<string, unknown>>>();
+  if (include_download_urls) {
+    for (const exp of explanations) {
+      if (!summarizeExplanationAttachmentRefs(exp).has_attachment) continue;
+      const attachments = await listExplanationAttachments(client, exp.url);
+      downloads.set(exp.url, attachments.map((attachment) => ({
+        ...publicAttachmentMetadata(attachment),
+        content_src: attachment.content_src,
+        expires_at: attachment.expires_at,
+      })));
+    }
+  }
 
   // Format response
   return formatResponse(
@@ -75,7 +89,9 @@ export async function listBankTransactionExplanations(
           transfer_bank_account: exp.transfer_bank_account,
           has_attachment: attachmentSummary.has_attachment,
           attachment_count: attachmentSummary.attachment_count,
-          attachments: attachmentSummary.attachments
+          attachments: downloads.get(exp.url) ?? attachmentSummary.attachments,
+          // Compatibility for existing exporters reading the first receipt.
+          ...(include_download_urls ? { attachment: downloads.get(exp.url)?.[0] } : {})
         };
       }),
       pagination: {

@@ -177,6 +177,9 @@ export const AttachmentContentTypeSchema = z.enum([
 ]);
 
 export const AttachmentSchema = z.object({
+  url: z.string().url()
+    .optional()
+    .describe("Public HTTPS download URL fetched by the server. Provide exactly one of url, path, upload_id or data. File sharing permissions are not changed."),
   path: z.string()
     .optional()
     .describe(
@@ -602,6 +605,9 @@ export const CreateTimeslipInputSchema = z.object({
 
 // Bank transaction explanation schemas
 export const ListBankTransactionExplanationsInputSchema = z.object({
+  include_download_urls: z.boolean()
+    .optional()
+    .describe("Include short-lived receipt download URLs for bulk export. Requires one additional API read per explanation with attachments; use a small per_page. Off by default."),
   bank_account: z.string()
     .optional()
     .describe("Filter by bank account URL or ID"),
