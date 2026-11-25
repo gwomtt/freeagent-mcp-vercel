@@ -394,7 +394,7 @@ All tools provide clear error messages:
 | 403 Forbidden | Insufficient permissions | Check account permission level |
 | 404 Not Found | Resource doesn't exist | Verify ID or URL is correct |
 | 422 Validation Error | Invalid input data | Check required fields and formats |
-| 429 Rate Limit | Too many requests | Wait 60 seconds before retrying |
+| 429 Rate Limit | Too many requests | Wait for the `Retry-After` seconds shown in the error |
 
 ---
 
@@ -411,10 +411,10 @@ All tools provide clear error messages:
 
 ## Rate Limits
 
-**Production API**: 15 requests per 60 seconds
-**Sandbox API**: 5 requests per 60 seconds
+**Production API**: 120 requests per minute, 3600 per hour (15 token refreshes per minute)
+**Sandbox test header** (`X-RateLimit-Test: true`): 5 requests per minute
 
-The server automatically handles rate limit errors and tells you when to retry.
+On HTTP 429 the server returns an error that includes FreeAgent's `Retry-After` timing so you know when to retry. It does not automatically back off and re-issue the request.
 
 ---
 
@@ -494,11 +494,13 @@ Creates a new expense or mileage claim with optional receipt attachment.
 - `initial_mileage` (string, optional): Starting odometer reading
 - `mileage_type` (string, optional): 'Business' or 'Personal'
 
-**For Attachments:**
+**For Attachments** (exactly one source):
 - `attachment` (object, optional):
-  - `data` (string): Base64 encoded file content
-  - `file_name` (string): Original filename
-  - `content_type` (string): `application/pdf`, `image/png`, `image/jpeg`, `image/gif`
+  - `path` (string, preferred on local/stdio): file under `FREEAGENT_ATTACHMENTS_DIR` — server reads it
+  - `upload_id` (string, preferred on remote MCP): from `freeagent_prepare_attachment_upload` after the host PUT the file
+  - `data` (string, optional): Base64 encoded file content (fallback)
+  - `is_gzipped` (boolean, optional): inline `data` was gzipped before Base64
+  - `file_name` / `content_type`: required with `data`; optional with `path` / `upload_id` (inferred)
   - `description` (string, optional): Attachment description
 
 **Example usage:**
@@ -509,7 +511,9 @@ Add receipt for taxi expense with attachment
 ```
 
 **Tips:**
-- Use the `file-to-base64` Claude Code skill to prepare receipt attachments
+- Locally: set `FREEAGENT_ATTACHMENTS_DIR` and pass `attachment.path`
+- On remote MCP: call `freeagent_prepare_attachment_upload` then PUT bytes and pass `upload_id`
+- Inline `data` remains a fallback (optionally via the `file-to-base64` skill)
 - For mileage, FreeAgent auto-calculates amounts based on HMRC rates
 - Supported attachment formats: PDF, PNG, JPEG, GIF (max 5MB)
 
@@ -524,7 +528,9 @@ Updates an existing expense in FreeAgent. Only provide the fields you want to ch
 **Parameters:**
 - `expense_id` (string, required): The FreeAgent expense ID or full URL
 
-All other parameters from `freeagent_create_expense` are accepted as optional overrides (e.g., `description`, `gross_value`, `category`, `dated_on`, `currency`, `ec_status`, `project`, mileage fields, recurring fields).
+All other parameters from `freeagent_create_expense` are accepted as optional overrides: `user`, `description`, `gross_value`, `category`, `dated_on`, `currency`, `ec_status`, `receipt_reference`, `project`, `attachment`, plus the mileage and recurring fields.
+
+**Attaching a receipt:** pass `attachment` (same object format as `create`).
 
 **Example usage:**
 ```
@@ -625,11 +631,8 @@ Creates a new time tracking entry with optional file attachment.
 
 **Optional:**
 - `comment` (string): Description of work performed
-- `attachment` (object):
-  - `data` (string): Base64 encoded file content
-  - `file_name` (string): Original filename
-  - `content_type` (string): MIME type
-  - `description` (string, optional): Attachment description
+
+**Note:** timeslips do not currently accept an `attachment` through this server.
 
 **Example usage:**
 ```
@@ -779,7 +782,7 @@ List explanations for account 123
 Show explanations from January
 ```
 
-**Returns:** List of explanations with dates, amounts, descriptions, categorization details, and review status.
+**Returns:** List of explanations with dates, amounts, descriptions, categorization details, and review status. Each row reports `has_attachment`, `attachment_count`, and an `attachments` array of `{ url }` refs. FreeAgent's `2026-09-01` API only embeds URLs on the explanation itself — use `freeagent_list_bank_transaction_explanation_attachments` or `freeagent_get_bank_transaction_explanation` for file name / size / type. **One** list call still tells you which transactions need a receipt.
 
 ---
 
@@ -797,7 +800,25 @@ Show details for explanation 456
 What category was assigned to this explanation?
 ```
 
-**Returns:** Complete explanation details including categorization, tax info, and linked entities (invoices, bills, transfers).
+**Returns:** Complete explanation details including categorization, tax info, linked entities (invoices, bills, transfers), and attachment metadata (file name, size, type). Short-lived `content_src` download URLs are omitted.
+
+---
+
+### freeagent_list_bank_transaction_explanation_attachments
+
+Lists all file attachments on one bank transaction explanation (up to 50), with file name, size, and content type.
+
+**Parameters:**
+- `bank_transaction_explanation_id` (string, required): The FreeAgent explanation ID or full URL
+- `response_format` (string, default: "markdown"): Output format
+
+**Example usage:**
+```
+List attachments on explanation 456
+What receipts are on this bank explanation?
+```
+
+**Returns:** Attachment count plus metadata for each file (URL, file name, size, content type). Prefer this after list_explanations shows `has_attachment` when you need names without the full explanation payload.
 
 ---
 
@@ -852,7 +873,9 @@ Updates an existing bank transaction explanation. Only provide the fields you wa
 **Parameters:**
 - `bank_transaction_explanation_id` (string, required): The FreeAgent explanation ID or full URL
 
-All other parameters from `freeagent_create_bank_transaction_explanation` are accepted as optional overrides (e.g., `dated_on`, `description`, `gross_value`, `category`, `paid_invoice`, `paid_bill`, `sales_tax_rate`, `transfer_bank_account`).
+These parameters from `freeagent_create_bank_transaction_explanation` are accepted as optional overrides: `dated_on`, `description`, `gross_value`, `category`, `ec_status`, `marked_for_review`, `receipt_reference`, `paid_invoice`, `paid_bill`, `paid_user`, `project`, `sales_tax_rate`, `sales_tax_value`, `transfer_bank_account`, `attachment`.
+
+**Attaching a receipt:** pass `attachment` (same object format as `create`). This is the normal route for bank-feed transactions, which arrive already created and are usually auto-explained by FreeAgent's guess rules, so `create` has already happened by the time you want to add the receipt. Attachments are **added** (explanations support up to 50); they are not replaced. Use `freeagent_delete_attachment` to remove one.
 
 **Example usage:**
 ```
@@ -898,7 +921,11 @@ Explain transaction 789 as paying bill SUP-99
 
 ### Overview
 
-Expenses, timeslips, and bank transaction explanations support file attachments for receipts, invoices, and supporting documents.
+Expenses and bank transaction explanations support file attachments for receipts, invoices, and supporting documents, on both **create** and **update**. Timeslips do not.
+
+To find what is missing a receipt, use `freeagent_list_bank_transaction_explanations` and read `has_attachment` on each row, then add the file with `freeagent_update_bank_transaction_explanation`. For file names/sizes, call `freeagent_list_bank_transaction_explanation_attachments`. Remove one with `freeagent_delete_attachment`.
+
+This server always sends `X-Api-Version: 2026-09-01` and uses the [Bank Transaction Explanation Attachments API](https://dev.freeagent.com/docs/bank_transaction_explanation_attachments?version=2026-09-01) for create/update writes. That becomes FreeAgent's default behaviour on **1 December 2026** (up to 50 attachments; singular `attachment` on explanations is no longer returned). Override the version only for debugging via `FREEAGENT_X_API_VERSION`.
 
 ### Supported Formats
 
@@ -909,16 +936,15 @@ Expenses, timeslips, and bank transaction explanations support file attachments 
 
 **Maximum file size**: 5MB per attachment
 
-### Using the file-to-base64 Skill
+### Attachment modes (pick one)
 
-Claude Code includes a `file-to-base64` skill in `.claude/skills/file-to-base64/` that helps prepare attachments by:
+1. **Local path (stdio)** — set `FREEAGENT_ATTACHMENTS_DIR` to a dedicated receipts folder and pass `attachment.path`. The server reads the file; the model never emits base64. Paths outside that directory are refused (symlink-safe).
+2. **Remote staging** — configure S3-compatible env vars, call `freeagent_prepare_attachment_upload`, **PUT** raw bytes to the URL, then pass `attachment.upload_id`. See `VERCEL_DEPLOYMENT.md`.
+3. **Inline base64** — `attachment.data` (+ optional `is_gzipped`). Slow on remote hosts when the model streams every character; fine for tiny files.
 
-- Validating file format and size
-- Converting files to Base64
-- Detecting MIME types automatically
-- Checking file permissions
+### Using the file-to-base64 Skill (inline fallback)
 
-Simply provide the file path when creating expenses, timeslips, or explanations, and Claude will use the skill to prepare the attachment.
+Claude Code includes a `file-to-base64` skill in `.claude/skills/file-to-base64/` for the inline `data` fallback. Prefer `attachment.path` locally when `FREEAGENT_ATTACHMENTS_DIR` is set.
 
 ### Manual Preparation (if needed)
 
@@ -933,11 +959,12 @@ stat -c%s /path/to/file.pdf  # Linux
 
 ### Best Practices
 
-1. **Compress large images** before uploading
-2. **Use descriptive filenames** for easy identification
-3. **Add descriptions** to explain what the attachment shows
-4. **Check file size** - must be under 5MB
-5. **Use appropriate formats** - PDF for documents, PNG/JPEG for photos
+1. **Prefer `upload_id` on remote MCP** so the model never emits base64
+2. **Compress large images** before uploading
+3. **Use descriptive filenames** for easy identification
+4. **Add descriptions** to explain what the attachment shows
+5. **Check file size** - must be under 5MB
+6. **Use appropriate formats** - PDF for documents, PNG/JPEG for photos
 
 ---
 

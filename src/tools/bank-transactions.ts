@@ -5,7 +5,6 @@
  * expenses, and other accounting entries.
  */
 
-import { gunzipSync } from "zlib";
 import type { FreeAgentApiClient } from "../services/api-client.js";
 import type { FreeAgentBankTransactionExplanation } from "../types.js";
 import type {
@@ -13,9 +12,18 @@ import type {
   GetBankTransactionExplanationInput,
   CreateBankTransactionExplanationInput,
   UpdateBankTransactionExplanationInput,
-  DeleteBankTransactionExplanationInput
+  DeleteBankTransactionExplanationInput,
+  ListBankTransactionExplanationAttachmentsInput
 } from "../schemas/index.js";
 import { formatResponse, createPaginationMetadata, extractIdFromUrl } from "../services/formatter.js";
+import { buildAttachmentPayload } from "../services/attachment-payload.js";
+import { cleanupStagedAttachment } from "../services/attachment-staging.js";
+import {
+  addExplanationAttachments,
+  listExplanationAttachments,
+  publicAttachmentMetadata,
+  summarizeExplanationAttachmentRefs
+} from "../services/explanation-attachments.js";
 import { resourcePath } from "../utils/resource-path.js";
 
 /**
@@ -25,7 +33,7 @@ export async function listBankTransactionExplanations(
   client: FreeAgentApiClient,
   params: ListBankTransactionExplanationsInput
 ): Promise<string> {
-  const { page, per_page, bank_account, from_date, to_date, response_format } = params;
+  const { page, per_page, bank_account, from_date, to_date, response_format, include_download_urls } = params;
 
   // Build query parameters
   const queryParams: Record<string, string> = {
@@ -44,24 +52,48 @@ export async function listBankTransactionExplanations(
   const explanations = response.data.bank_transaction_explanations || [];
   const pagination = client.parsePaginationHeaders(response.headers);
 
+  // Preserve the deployment's opt-in bulk export without adding normal-list reads.
+  const downloads = new Map<string, Array<Record<string, unknown>>>();
+  if (include_download_urls) {
+    for (const exp of explanations) {
+      if (!summarizeExplanationAttachmentRefs(exp).has_attachment) continue;
+      const attachments = await listExplanationAttachments(client, exp.url);
+      downloads.set(exp.url, attachments.map((attachment) => ({
+        ...publicAttachmentMetadata(attachment),
+        content_src: attachment.content_src,
+        expires_at: attachment.expires_at,
+      })));
+    }
+  }
+
   // Format response
   return formatResponse(
     {
-      explanations: explanations.map((exp: FreeAgentBankTransactionExplanation) => ({
-        url: exp.url,
-        dated_on: exp.dated_on,
-        description: exp.description,
-        gross_value: exp.gross_value,
-        bank_transaction: exp.bank_transaction,
-        category: exp.category,
-        ec_status: exp.ec_status,
-        receipt_reference: exp.receipt_reference,
-        marked_for_review: exp.marked_for_review,
-        paid_invoice: exp.paid_invoice,
-        paid_bill: exp.paid_bill,
-        paid_user: exp.paid_user,
-        transfer_bank_account: exp.transfer_bank_account
-      })),
+      explanations: explanations.map((exp: FreeAgentBankTransactionExplanation) => {
+        // Under X-Api-Version 2026-09-01, explanations embed attachment URLs
+        // only (no file_name/size). Use list_…_attachments for metadata.
+        const attachmentSummary = summarizeExplanationAttachmentRefs(exp);
+        return {
+          url: exp.url,
+          dated_on: exp.dated_on,
+          description: exp.description,
+          gross_value: exp.gross_value,
+          bank_transaction: exp.bank_transaction,
+          category: exp.category,
+          ec_status: exp.ec_status,
+          receipt_reference: exp.receipt_reference,
+          marked_for_review: exp.marked_for_review,
+          paid_invoice: exp.paid_invoice,
+          paid_bill: exp.paid_bill,
+          paid_user: exp.paid_user,
+          transfer_bank_account: exp.transfer_bank_account,
+          has_attachment: attachmentSummary.has_attachment,
+          attachment_count: attachmentSummary.attachment_count,
+          attachments: downloads.get(exp.url) ?? attachmentSummary.attachments,
+          // Compatibility for existing exporters reading the first receipt.
+          ...(include_download_urls ? { attachment: downloads.get(exp.url)?.[0] } : {})
+        };
+      }),
       pagination: {
         page,
         per_page,
@@ -99,8 +131,13 @@ export async function listBankTransactionExplanations(
         const desc = exp.description || 'No description';
         const reviewStatus = exp.marked_for_review ? ' ⚠️ NEEDS REVIEW' : '';
 
+        const attachmentSummary = summarizeExplanationAttachmentRefs(exp);
+        const receiptNote = attachmentSummary.has_attachment
+          ? ` [${attachmentSummary.attachment_count} attachment(s)]`
+          : " [no receipt]";
+
         lines.push(`## ${exp.dated_on} - ${amountStr}${reviewStatus} (ID: ${id})`);
-        lines.push(`${desc}`);
+        lines.push(`${desc}${receiptNote}`);
         if (exp.category) lines.push(`Category: ${exp.category}`);
         if (exp.paid_invoice) lines.push(`Paid Invoice: ${exp.paid_invoice}`);
         if (exp.paid_bill) lines.push(`Paid Bill: ${exp.paid_bill}`);
@@ -127,10 +164,21 @@ export async function getBankTransactionExplanation(
 
   const response = await client.get<{ bank_transaction_explanation: FreeAgentBankTransactionExplanation }>(explanationUrl);
   const exp = response.data.bank_transaction_explanation;
+  const attachmentSummary = summarizeExplanationAttachmentRefs(exp);
+  const attachmentDetails = attachmentSummary.has_attachment
+    ? (await listExplanationAttachments(client, exp.url)).map(publicAttachmentMetadata)
+    : [];
+
+  const payload = {
+    ...exp,
+    has_attachment: attachmentSummary.has_attachment,
+    attachment_count: attachmentSummary.attachment_count || attachmentDetails.length,
+    attachments: attachmentDetails.length > 0 ? attachmentDetails : attachmentSummary.attachments
+  };
 
   // Format response
   return formatResponse(
-    exp,
+    payload,
     response_format,
     () => {
       const lines: string[] = ["# Bank Transaction Explanation Details", ""];
@@ -182,8 +230,15 @@ export async function getBankTransactionExplanation(
         lines.push(`- **Sales Tax Value**: ${exp.sales_tax_value}`);
       }
 
-      if (exp.attachment_count && exp.attachment_count > 0) {
-        lines.push(`- **Attachments**: ${exp.attachment_count} file(s)`);
+      if (attachmentDetails.length > 0) {
+        lines.push(`- **Attachments**: ${attachmentDetails.length} file(s)`);
+        for (const a of attachmentDetails) {
+          lines.push(
+            `  - ${a.file_name ?? "file"} (${a.content_type ?? "?"}, ${a.file_size ?? "?"} bytes) — ${a.url ?? ""}`
+          );
+        }
+      } else {
+        lines.push(`- **Attachments**: none`);
       }
 
       lines.push("");
@@ -238,35 +293,12 @@ export async function createBankTransactionExplanation(
     explanationPayload.transfer_bank_account = params.transfer_bank_account;
   }
 
-  // Add attachment if provided
-  if (params.attachment) {
-    let attachmentData = params.attachment.data;
-
-    // If attachment is gzipped, decompress it before sending to FreeAgent
-    if (params.attachment.is_gzipped) {
-      try {
-        // Decode Base64 to Buffer
-        const compressedBuffer = Buffer.from(attachmentData, 'base64');
-        // Decompress using gunzip
-        const decompressedBuffer = gunzipSync(compressedBuffer);
-        // Re-encode to Base64
-        attachmentData = decompressedBuffer.toString('base64');
-      } catch (error) {
-        throw new Error(`Failed to decompress gzipped attachment: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      }
-    }
-
-    const attachmentPayload: Record<string, string> = {
-      data: attachmentData,
-      file_name: params.attachment.file_name,
-      content_type: params.attachment.content_type
-    };
-    if (params.attachment.description) {
-      attachmentPayload.description = params.attachment.description;
-    }
-    explanationPayload.attachment = attachmentPayload;
-  }
-
+  // Attachments are added via the Explanation Attachments API after create
+  // (nested `attachment` is not accepted under X-Api-Version 2026-09-01).
+  // Resolve before creating a record so an invalid/missing upload makes no write.
+  const attachmentPayload = params.attachment
+    ? await buildAttachmentPayload(params.attachment)
+    : undefined;
   const response = await client.post<{ bank_transaction_explanation: FreeAgentBankTransactionExplanation }>(
     "/bank_transaction_explanations",
     { bank_transaction_explanation: explanationPayload }
@@ -275,6 +307,29 @@ export async function createBankTransactionExplanation(
   const explanation = response.data.bank_transaction_explanation;
   const explanationId = extractIdFromUrl(explanation.url);
 
+  if (attachmentPayload) {
+    const payload = attachmentPayload;
+    try {
+      await addExplanationAttachments(client, explanation.url, [
+        {
+          data: payload.data,
+          file_name: payload.file_name,
+          content_type: payload.content_type,
+          description: payload.description
+        }
+      ]);
+    } catch (error) {
+      throw new Error(
+        `Explanation ${explanationId} was created, but its attachment was not confirmed saved. ` +
+        `Do not create the explanation again. Check its attachments, then retry with ` +
+        `freeagent_update_bank_transaction_explanation and bank_transaction_explanation_id=${explanationId}. ` +
+        (params.attachment?.upload_id ? `The staged upload is retained until expiry. ` : "") +
+        `(${error instanceof Error ? error.message : "unknown error"})`
+      );
+    }
+    await cleanupStagedAttachment(params.attachment?.upload_id);
+  }
+
   // Determine explanation type
   let explanationType = "general transaction";
   if (params.paid_invoice) explanationType = "invoice payment";
@@ -282,7 +337,9 @@ export async function createBankTransactionExplanation(
   else if (params.paid_user) explanationType = "user payment";
   else if (params.transfer_bank_account) explanationType = "bank transfer";
 
-  const attachmentInfo = params.attachment ? ` with attachment (${params.attachment.file_name})` : '';
+  const attachmentInfo = params.attachment
+    ? ` with attachment (${params.attachment.file_name ?? params.attachment.path ?? params.attachment.upload_id ?? "file"})`
+    : "";
 
   return `✅ Successfully explained bank transaction as ${explanationType}${attachmentInfo}\n\n` +
     `**Explanation ID**: ${explanationId}\n` +
@@ -335,12 +392,42 @@ export async function updateBankTransactionExplanation(
     explanationPayload.transfer_bank_account = updateFields.transfer_bank_account;
   }
 
-  const response = await client.put<{ bank_transaction_explanation: FreeAgentBankTransactionExplanation }>(
-    explanationUrl,
-    { bank_transaction_explanation: explanationPayload }
-  );
+  const hasFieldUpdates = Object.keys(explanationPayload).length > 0;
+  let explanation: FreeAgentBankTransactionExplanation;
 
-  const explanation = response.data.bank_transaction_explanation;
+  if (hasFieldUpdates) {
+    const response = await client.put<{ bank_transaction_explanation: FreeAgentBankTransactionExplanation }>(
+      explanationUrl,
+      { bank_transaction_explanation: explanationPayload }
+    );
+    explanation = response.data.bank_transaction_explanation;
+  } else {
+    const response = await client.get<{ bank_transaction_explanation: FreeAgentBankTransactionExplanation }>(
+      explanationUrl
+    );
+    explanation = response.data.bank_transaction_explanation;
+  }
+
+  // Attachment adds via the Attachments API (does not replace existing files;
+  // explanations support up to 50). Nested `attachment` on PUT is rejected
+  // under X-Api-Version 2026-09-01.
+  let attachmentNote = "";
+  if (updateFields.attachment !== undefined) {
+    const payload = await buildAttachmentPayload(updateFields.attachment);
+    const attachments = await addExplanationAttachments(client, explanation.url, [
+      {
+        data: payload.data,
+        file_name: payload.file_name,
+        content_type: payload.content_type,
+        description: payload.description
+      }
+    ]);
+    await cleanupStagedAttachment(updateFields.attachment.upload_id);
+    attachmentNote =
+      `\n**Attachments now**: ${attachments.length} file(s)` +
+      (payload.file_name ? ` (added ${payload.file_name})` : "");
+  }
+
   const explanationId = extractIdFromUrl(explanation.url);
 
   // Determine explanation type
@@ -356,7 +443,8 @@ export async function updateBankTransactionExplanation(
     `**Amount**: ${explanation.gross_value}\n` +
     (explanation.description ? `**Description**: ${explanation.description}\n` : '') +
     (explanation.category ? `**Category**: ${explanation.category}\n` : '') +
-    `**URL**: ${explanation.url}`;
+    `**URL**: ${explanation.url}` +
+    attachmentNote;
 }
 
 
@@ -366,4 +454,46 @@ export async function deleteBankTransactionExplanation(
 ): Promise<string> {
   await client.delete(resourcePath(params.bank_transaction_explanation_id, "bank_transaction_explanations"));
   return `✅ Bank transaction explanation deleted: ${params.bank_transaction_explanation_id}`;
+}
+
+/**
+ * List full attachment metadata for one explanation (file names, sizes, types).
+ * Prefer this after list_explanations shows has_attachment — explanation list
+ * rows only include attachment URLs under API version 2026-09-01.
+ */
+export async function listBankTransactionExplanationAttachments(
+  client: FreeAgentApiClient,
+  params: ListBankTransactionExplanationAttachmentsInput
+): Promise<string> {
+  const { bank_transaction_explanation_id, response_format } = params;
+  const attachments = (
+    await listExplanationAttachments(client, bank_transaction_explanation_id)
+  ).map(publicAttachmentMetadata);
+
+  return formatResponse(
+    {
+      bank_transaction_explanation_id,
+      attachment_count: attachments.length,
+      attachments
+    },
+    response_format,
+    () => {
+      const lines: string[] = [
+        `# Attachments for explanation ${bank_transaction_explanation_id}`,
+        ""
+      ];
+      if (attachments.length === 0) {
+        lines.push("No attachments.");
+        return lines.join("\n");
+      }
+      for (const a of attachments) {
+        lines.push(
+          `- **${a.file_name ?? "file"}** — ${a.content_type ?? "?"}, ${a.file_size ?? "?"} bytes`
+        );
+        if (a.url) lines.push(`  - URL: ${a.url}`);
+        if (a.description) lines.push(`  - ${a.description}`);
+      }
+      return lines.join("\n");
+    }
+  );
 }

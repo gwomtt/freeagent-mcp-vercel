@@ -369,6 +369,14 @@ export async function createInvoice(
     invoiceData.discount_percent = params.discount_percent;
   }
 
+  if (params.ec_status) {
+    invoiceData.ec_status = params.ec_status;
+  }
+
+  if (params.place_of_supply) {
+    invoiceData.place_of_supply = params.place_of_supply;
+  }
+
   const response = await client.post<{ invoice: FreeAgentInvoice }>(
     "/invoices",
     { invoice: invoiceData }
@@ -432,7 +440,7 @@ export async function sendInvoiceEmail(
   if (params.subject) email.subject = params.subject;
   if (params.body) email.body = params.body;
   if (params.from) email.from = params.from;
-  await client.post(`/invoices/${id}/emails`, { invoice: { email } });
+  await client.post(`/invoices/${id}/send_email`, { invoice: { email } });
   return `✅ Invoice email sent for ${params.invoice_id}`;
 }
 

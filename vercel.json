@@ -1,5 +1,5 @@
 {
-  "buildCommand": "bun run build",
+  "buildCommand": "bun run lint && bun run test && bun run build",
   "installCommand": "npx -y bun@1.4.2 install",
   "functions": {
     "api/index.ts": {

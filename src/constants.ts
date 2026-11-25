@@ -9,12 +9,26 @@ export const API_BASE_URL = "https://api.freeagent.com";
 export const SANDBOX_API_BASE_URL = "https://api.sandbox.freeagent.com";
 export const API_VERSION = "v2";
 
+/**
+ * FreeAgent `X-Api-Version` header. Pinned to `2026-09-01` so bank transaction
+ * explanations use the multi-attachment Attachments API (default from
+ * 1 December 2026). Override with FREEAGENT_X_API_VERSION only for debugging.
+ */
+export const FREEAGENT_X_API_VERSION =
+  (typeof process !== "undefined" && process.env.FREEAGENT_X_API_VERSION?.trim()) ||
+  "2026-09-01";
+
 // Character limit for response truncation
 export const CHARACTER_LIMIT = 25000;
 
-// Rate limiting
-export const RATE_LIMIT_REQUESTS = 15;
-export const RATE_LIMIT_WINDOW_SECONDS = 60;
+// FreeAgent API rate limits (per user). See https://dev.freeagent.com/docs/introduction
+export const RATE_LIMIT_REQUESTS_PER_MINUTE = 120;
+export const RATE_LIMIT_REQUESTS_PER_HOUR = 3600;
+export const RATE_LIMIT_TOKEN_REFRESHES_PER_MINUTE = 15;
+/** Default wait when FreeAgent omits Retry-After on a 429. */
+export const RATE_LIMIT_DEFAULT_RETRY_AFTER_SECONDS = 60;
+/** Sandbox limit when the client sends `X-RateLimit-Test: true`. */
+export const RATE_LIMIT_SANDBOX_TEST_REQUESTS_PER_MINUTE = 5;
 
 // Pagination defaults
 export const DEFAULT_PAGE_SIZE = 25;

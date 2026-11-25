@@ -4,6 +4,7 @@
 
 import { z } from "zod";
 import { ResponseFormat, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE } from "../constants.js";
+import { InvoiceEcStatusSchema } from "./gaps.js";
 
 // Base pagination schema
 export const PaginationSchema = z.object({
@@ -76,9 +77,13 @@ export const CreateContactInputSchema = z.object({
   phone_number: z.string().optional().describe("Phone number"),
   mobile: z.string().optional().describe("Mobile number"),
   address1: z.string().optional().describe("Address line 1"),
+  address2: z.string().optional().describe("Address line 2"),
   town: z.string().optional().describe("Town/City"),
+  region: z.string().optional().describe("Region/County/State"),
   postcode: z.string().optional().describe("Postal code"),
-  country: z.string().optional().describe("Country code (e.g., GB, US)")
+  country: z.string().optional().describe("Country name as FreeAgent spells it (e.g., 'United Kingdom', 'Germany')"),
+  sales_tax_registration_number: z.string().optional().describe("Contact's VAT/sales tax registration number (e.g., 'DE123456789')"),
+  charge_sales_tax: z.enum(["Auto", "Always", "Never"]).optional().describe("Whether invoices to this contact charge sales tax")
 }).strict();
 
 // Invoice schemas
@@ -124,11 +129,16 @@ export const CreateInvoiceInputSchema = z.object({
   discount_percent: z.string()
     .optional()
     .describe("Discount to apply, as a decimal string (e.g., '20' for 20%)."),
+  ec_status: InvoiceEcStatusSchema.optional(),
+  place_of_supply: z.string()
+    .optional()
+    .describe("Customer's country name, required by FreeAgent when ec_status is 'EC VAT MOSS' (e.g., 'Germany')"),
   invoice_items: z.array(z.object({
     item_type: z.string().describe("Item type (e.g., 'Hours', 'Days', 'Products')"),
     description: z.string().describe("Item description"),
     price: z.string().describe("Price per unit"),
-    quantity: z.string().describe("Quantity")
+    quantity: z.string().describe("Quantity"),
+    sales_tax_rate: z.string().optional().describe("VAT rate as a percentage string (e.g., '20.0', or '19.0' for German OSS). Omit to use FreeAgent's default.")
   })).min(1).describe("Array of invoice line items")
 }).strict();
 
@@ -157,18 +167,61 @@ export const GetExpenseInputSchema = z.object({
   response_format: ResponseFormatSchema
 }).strict();
 
-// Attachment schema for expenses and bank transaction explanations
-// PERFORMANCE NOTE: For large files, use gzip compression before Base64 encoding to significantly reduce size
-// and speed up LLM processing (which processes character-by-character). The server will automatically decompress.
-const AttachmentSchema = z.object({
-  data: z.string().describe("Base64 encoded file content. For large files, gzip compress first then Base64 encode, and set is_gzipped=true"),
+// Attachment schema for expenses and bank transaction explanations.
+// Exactly one source: path (local), upload_id (S3 staging), or data (inline base64).
+export const AttachmentContentTypeSchema = z.enum([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+]);
+
+export const AttachmentSchema = z.object({
+  url: z.string().url()
+    .optional()
+    .describe("Public HTTPS download URL fetched by the server. Provide exactly one of url, path, upload_id or data. File sharing permissions are not changed."),
+  path: z.string()
+    .optional()
+    .describe(
+      "Local file path under FREEAGENT_ATTACHMENTS_DIR. Best for stdio/local MCP — the server reads and encodes the file so the model never emits base64. Not usable on remote hosts that cannot see your disk."
+    ),
+  data: z.string()
+    .optional()
+    .describe(
+      "Base64 encoded file content (fallback). Prefer path locally or upload_id on remote MCP. For large inline files, gzip first then Base64 encode and set is_gzipped=true."
+    ),
+  upload_id: z.string()
+    .optional()
+    .describe(
+      "Opaque token from freeagent_prepare_attachment_upload after the host PUT the file to the returned URL. Prefer this on remote MCP."
+    ),
   is_gzipped: z.boolean()
     .optional()
-    .describe("Set to true if the data is gzip-compressed before Base64 encoding (default: false). Server will automatically decompress before uploading to FreeAgent."),
-  file_name: z.string().describe("Original filename"),
-  content_type: z.enum(["application/pdf", "image/png", "image/jpeg", "image/gif"])
-    .describe("MIME type of the file"),
-  description: z.string().optional().describe("Optional description of the attachment")
+    .describe(
+      "Set to true if inline data is gzip-compressed before Base64 encoding (default: false). Only valid with data."
+    ),
+  file_name: z.string()
+    .optional()
+    .describe(
+      "Original filename. Required with data; optional with path/upload_id (inferred from the file or staging token)."
+    ),
+  content_type: AttachmentContentTypeSchema
+    .optional()
+    .describe(
+      "MIME type. Required with data; optional with path/upload_id (inferred from extension or staging token)."
+    ),
+  description: z.string().optional().describe("Optional description of the attachment"),
+}).strict();
+
+export const PrepareAttachmentUploadInputSchema = z.object({
+  file_name: z.string().min(1).describe("Original filename (e.g. receipt.pdf)"),
+  content_type: AttachmentContentTypeSchema.describe("MIME type of the file to upload"),
+  size: z.number()
+    .int()
+    .positive()
+    .max(5 * 1024 * 1024)
+    .describe("Exact file size in bytes (max 5242880 / 5MB). Must match the PUT body."),
+  response_format: ResponseFormatSchema,
 }).strict();
 
 export const CreateExpenseInputSchema = z.object({
@@ -284,6 +337,9 @@ export const UpdateExpenseInputSchema = z.object({
   receipt_reference: z.string()
     .optional()
     .describe("Receipt reference identifier"),
+  attachment: AttachmentSchema
+    .optional()
+    .describe("File attachment (receipt) for the expense"),
   project: z.string()
     .optional()
     .describe("Project URL or ID to associate with expense"),
@@ -549,6 +605,9 @@ export const CreateTimeslipInputSchema = z.object({
 
 // Bank transaction explanation schemas
 export const ListBankTransactionExplanationsInputSchema = z.object({
+  include_download_urls: z.boolean()
+    .optional()
+    .describe("Include short-lived receipt download URLs for bulk export. Requires one additional API read per explanation with attachments; use a small per_page. Off by default."),
   bank_account: z.string()
     .optional()
     .describe("Filter by bank account URL or ID"),
@@ -566,6 +625,13 @@ export const ListBankTransactionExplanationsInputSchema = z.object({
 }).strict();
 
 export const GetBankTransactionExplanationInputSchema = z.object({
+  bank_transaction_explanation_id: z.string()
+    .min(1)
+    .describe("The FreeAgent bank transaction explanation ID (numeric) or full URL"),
+  response_format: ResponseFormatSchema
+}).strict();
+
+export const ListBankTransactionExplanationAttachmentsInputSchema = z.object({
   bank_transaction_explanation_id: z.string()
     .min(1)
     .describe("The FreeAgent bank transaction explanation ID (numeric) or full URL"),
@@ -620,10 +686,12 @@ export const CreateBankTransactionExplanationInputSchema = z.object({
   transfer_bank_account: z.string()
     .optional()
     .describe("Destination bank account URL or ID for transfers"),
-  // Attachment
+  // Attachment — posted via Explanation Attachments API after create
   attachment: AttachmentSchema
     .optional()
-    .describe("Optional file attachment for the explanation")
+    .describe(
+      "Optional receipt to attach after creating the explanation (Attachments API; up to 50 per explanation)"
+    )
 }).strict();
 
 export const UpdateBankTransactionExplanationInputSchema = z.object({
@@ -675,7 +743,13 @@ export const UpdateBankTransactionExplanationInputSchema = z.object({
   // Transfer information
   transfer_bank_account: z.string()
     .optional()
-    .describe("Destination bank account URL or ID for transfers")
+    .describe("Destination bank account URL or ID for transfers"),
+  // Attachment — ADDS via Attachments API (does not replace existing files)
+  attachment: AttachmentSchema
+    .optional()
+    .describe(
+      "Receipt to ADD to this explanation (does not replace existing attachments; max 50 total). Same path/upload_id/data modes as expenses."
+    )
 }).strict();
 
 export const UpdateTimeslipInputSchema = z.object({
@@ -1036,6 +1110,9 @@ export type CreateTimeslipInput = z.infer<typeof CreateTimeslipInputSchema>;
 export type UpdateTimeslipInput = z.infer<typeof UpdateTimeslipInputSchema>;
 export type ListBankTransactionExplanationsInput = z.infer<typeof ListBankTransactionExplanationsInputSchema>;
 export type GetBankTransactionExplanationInput = z.infer<typeof GetBankTransactionExplanationInputSchema>;
+export type ListBankTransactionExplanationAttachmentsInput = z.infer<
+  typeof ListBankTransactionExplanationAttachmentsInputSchema
+>;
 export type CreateBankTransactionExplanationInput = z.infer<typeof CreateBankTransactionExplanationInputSchema>;
 export type UpdateBankTransactionExplanationInput = z.infer<typeof UpdateBankTransactionExplanationInputSchema>;
 export type GetCompanyInput = z.infer<typeof GetCompanyInputSchema>;
@@ -1058,6 +1135,8 @@ export type GetPriceListItemInput = z.infer<typeof GetPriceListItemInputSchema>;
 export type CreatePriceListItemInput = z.infer<typeof CreatePriceListItemInputSchema>;
 export type SearchToolsInput = z.infer<typeof SearchToolsInputSchema>;
 export type CallToolInput = z.infer<typeof CallToolInputSchema>;
+export type PrepareAttachmentUploadInput = z.infer<typeof PrepareAttachmentUploadInputSchema>;
+export type AttachmentInput = z.infer<typeof AttachmentSchema>;
 
 // Gap-coverage schemas
 export * from "./gaps.js";
